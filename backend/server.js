@@ -15,7 +15,8 @@ const app = express();
 
 // Allow multiple frontend ports (8080, 8081, or any localhost port for development)
 const allowedOrigins = [
-  "http://localhost:8080", 
+  "http://localhost:8080",
+  "https://coneadminbackend.comdata.in/"
 ];
 
 app.use(
@@ -2358,7 +2359,7 @@ ORDER BY
 // ---------------------------------------------
 // START SERVER
 // ---------------------------------------------
-const PORT = process.env.PORT || 5000;
+const PORT = process.env.PORT || 5001;
 app.listen(PORT, () => {
   console.log(`🚀 Server running on port ${PORT}`);
 });
