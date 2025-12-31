@@ -42,10 +42,6 @@ app.use(cors({
   allowedHeaders: ["Content-Type", "Authorization"],
 }));
 
-/* ✅ HANDLE PREFLIGHT */
-app.options("*", cors());
-
-
 
 // ---------------------------------------------
 // DB CONNECTION
