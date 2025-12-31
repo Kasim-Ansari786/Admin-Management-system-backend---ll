@@ -15,11 +15,12 @@ const app = express();
 
 // Allow common frontend dev ports (Vite/CRA) during development
 const allowedOrigins = [
+   "https://coneadmin.comdata.in",
   "http://localhost:8080",
   "http://localhost:8081",
   "http://127.0.0.1:8080",
   "http://127.0.0.1:8081",
-  "https://coneadmin.comdata.in"
+ 
 ];
 
 app.use(cors({
