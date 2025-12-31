@@ -13,24 +13,38 @@ const { Pool } = pg;
 
 const app = express();
 
-app.use(express.json());                 // ✅ FIRST
+/* ✅ BODY PARSER — FIRST */
+app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
+
+/* ✅ CORS — SECOND */
+const allowedOrigins = [
+  "https://coneadmin.comdata.in",
+  "http://localhost:8080",
+  "http://localhost:8081",
+  "http://127.0.0.1:8080",
+  "http://127.0.0.1:8081",
+];
 
 app.use(cors({
   origin: function (origin, callback) {
     if (!origin) return callback(null, true);
 
-    if (allowedOrigins.indexOf(origin) !== -1) {
+    if (allowedOrigins.includes(origin)) {
       callback(null, true);
     } else {
-      console.log("CORS blocked for origin:", origin);
-      callback(new Error("Not allowed by CORS"));
+      console.log("❌ CORS blocked for origin:", origin);
+      callback(null, false); // ❗ DO NOT throw error
     }
   },
   credentials: true,
   methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-  allowedHeaders: ["Content-Type", "Authorization", "X-Requested-With", "Accept"]
+  allowedHeaders: ["Content-Type", "Authorization"],
 }));
+
+/* ✅ HANDLE PREFLIGHT */
+app.options("*", cors());
+
 
 
 // ---------------------------------------------
