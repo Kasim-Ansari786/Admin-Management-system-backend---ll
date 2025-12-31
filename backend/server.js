@@ -22,6 +22,9 @@ const allowedOrigins = [
   "https://coneadmin.comdata.in"
 ];
 
+app.use(express.json());
+
+
 app.use(cors({
   origin: "https://coneadmin.comdata.in",
   credentials: true,
@@ -33,6 +36,9 @@ app.use(cors({
     "Accept"
   ]
 }));
+
+app.options("*", cors());
+
 
 // ---------------------------------------------
 // DB CONNECTION
@@ -47,7 +53,6 @@ const pool = new Pool({
 
 const JWT_SECRET = "your_super_secret_key_12345";
 
-app.use(express.json());
 
 // ---------------------------------------------
 // SIGNUP /api/signup
