@@ -13,26 +13,31 @@ const { Pool } = pg;
 
 const app = express();
 
-// Allow multiple frontend ports (8080, 8081, or any localhost port for development)
+// Allow common frontend dev ports (Vite/CRA) during development
 const allowedOrigins = [
   "http://localhost:8080",
-  "https://coneadmin.comdata.in"
+  "http://localhost:8081",
+  "http://127.0.0.1:8080",
+  "http://127.0.0.1:8081"
 ];
 
-app.use(
-  cors({
-    origin: (origin, callback) => {
-      if (!origin || allowedOrigins.includes(origin)) {
-        callback(null, true);
-      } else {
-        callback(new Error("Not allowed by CORS"));
-      }
-    },
-    methods: ["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
-    allowedHeaders: ["Content-Type", "Authorization"],
-    credentials: true,
-  })
-);
+app.use(cors({
+  origin: function (origin, callback) {
+    // Allow requests with no origin (like mobile apps or curl)
+    if (!origin) return callback(null, true);
+    
+    // Check if the origin is in our allowed list
+    if (allowedOrigins.indexOf(origin) !== -1) {
+      callback(null, true);
+    } else {
+      console.log("CORS blocked for origin:", origin);
+      callback(new Error("Not allowed by CORS"));
+    }
+  },
+  credentials: true,
+  methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization", "X-Requested-With", "Accept"]
+}));
 
 // ---------------------------------------------
 // DB CONNECTION
@@ -53,46 +58,67 @@ app.use(express.json());
 // ---------------------------------------------
 app.post("/api/signup", async (req, res) => {
   const { name, email, password, role } = req.body;
+
   if (!name || !email || !password || !role) {
     return res.status(400).json({
-      error:
-        "Missing required fields: name, email, password, and role are needed.",
+      error: "Missing required fields: name, email, password, and role are needed.",
     });
   }
 
+  const client = await pool.connect();
+
   try {
+    await client.query("BEGIN"); 
     const saltRounds = 10;
     const password_hash = await bcrypt.hash(password, saltRounds);
-    const sqlQuery = `
-            INSERT INTO cd.users_login (full_name, email, password_hash, role)
-            VALUES ($1, $2, $3, $4)
-            RETURNING id, full_name, email, role, created_at; 
-        `;
 
-    const values = [name, email, password_hash, role];
-    const result = await pool.query(sqlQuery, values);
+    // 2. Insert the User
+    const userSqlQuery = `
+      INSERT INTO cd.users_login (full_name, email, password_hash, role)
+      VALUES ($1, $2, $3, $4)
+      RETURNING id, full_name, email, role, created_at;
+    `;
+    const userValues = [name, email, password_hash, role];
+    const userResult = await client.query(userSqlQuery, userValues);
+    const newUser = userResult.rows[0];
+    const tenantSqlQuery = `
+      INSERT INTO cd.tenants (tenant_id, name)
+      VALUES ($1, $2);
+    `;
+    const tenantValues = [newUser.id, name]; 
+    await client.query(tenantSqlQuery, tenantValues);
+
+    await client.query("COMMIT");
+
     res.status(201).json({
-      message: "User created successfully",
-      user: result.rows[0],
-      tenant_id: result.rows[0].id,
+      message: "User and Tenant created successfully",
+      user: newUser,
+      tenant_id: newUser.id,
     });
+
   } catch (err) {
+    await client.query("ROLLBACK"); 
     console.error("SERVER ERROR during signup:", err.stack);
+
+    
     if (err.code === "23505") {
       return res.status(409).json({
         error: "A user with this email already exists.",
       });
     }
 
+    // Foreign key violation
     if (err.code === "23503") {
       return res.status(500).json({
-        error: `Database setup error: The 'fk_users_tenant' constraint still exists and must be dropped.`,
+        error: "Database constraint error. Please check database schema relations.",
       });
     }
 
     res.status(500).json({
       error: "An unexpected internal server error occurred during signup.",
     });
+  } finally {
+    client.release(); 
   }
 });
 
@@ -142,7 +168,10 @@ app.post("/api/login", async (req, res) => {
     if (!match) {
       return res.status(401).json({ error: "Invalid email or password." });
     }
-    if (user.role !== role) {
+    // Compare roles case-insensitively to avoid mismatches like 'Admin' vs 'admin'
+    const storedRole = user.role ? String(user.role).toLowerCase() : "";
+    const requestedRole = role ? String(role).toLowerCase() : "";
+    if (storedRole !== requestedRole) {
       return res
         .status(403)
         .json({ error: `Access denied: You must log in as a ${user.role}.` });
@@ -586,11 +615,14 @@ app.delete("/api/Player-Delete/:id", async (req, res) => {
 // 1. POST Route for adding a new coach (INSERT)
 app.post("/api/coaches", authenticateToken, async (req, res) => {
   const tenant_id = req.user.tenant_id;
+  
+  // Destructure with a fallback for 'location_name' if the frontend sends that instead
   const {
     coach_name,
     phone_numbers,
     email,
-    address,
+    location,
+    location_name, 
     players,
     salary,
     week_salary,
@@ -600,43 +632,40 @@ app.post("/api/coaches", authenticateToken, async (req, res) => {
     attendance,
   } = req.body;
 
+  // Final location value to be inserted
+  const finalLocation = location || location_name || null;
+
   if (!coach_name || !email) {
-    return res
-      .status(400)
-      .send({ message: "Coach name and email are required." });
+    return res.status(400).send({ message: "Coach name and email are required." });
   }
 
   if (!tenant_id) {
-    console.error(
-      "Authentication Error: tenant_id is missing from the verified JWT token."
-    );
-    return res
-      .status(401)
-      .send({ message: "Authentication failed. Tenant ID is missing." });
+    return res.status(401).send({ message: "Authentication failed. Tenant ID is missing." });
   }
 
   const sqlQuery = `
-        INSERT INTO cd.coaches_details 
-        (tenant_id, coach_name, phone_numbers, email, address, players, 
-         salary, week_salary, category, active, status, attendance)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
-        RETURNING coach_id, coach_name, tenant_id;
-    `;
+    INSERT INTO cd.coaches_details 
+    (tenant_id, coach_name, phone_numbers, email, location, players, 
+     salary, week_salary, category, active, status, attendance)
+    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+    RETURNING coach_id, coach_name, location, tenant_id;
+  `;
 
   const values = [
-    tenant_id, // $1: The authenticated and secure tenant_id (your fix)
-    coach_name, // $2
-    phone_numbers, // $3
-    email, // $4
-    address, // $5
-    players, // $6
-    salary, // $7
-    week_salary, // $8
-    category, // $9
-    active, // $10
-    status, // $11
-    attendance, // $12
+    tenant_id,      // $1
+    coach_name,     // $2
+    phone_numbers,  // $3
+    email,          // $4
+    finalLocation,  // $5 (This matches the 'location' column in your DB)
+    players,        // $6
+    salary,         // $7
+    week_salary,    // $8
+    category,       // $9
+    active,         // $10
+    status,         // $11
+    attendance,     // $12
   ];
+
   console.log("SQL VALUES being inserted:", values);
 
   try {
@@ -648,7 +677,6 @@ app.post("/api/coaches", authenticateToken, async (req, res) => {
   } catch (error) {
     console.error("--- Database Error during INSERT /api/coaches ---");
     console.error(error);
-    console.error("----------------------------------------------------");
     res.status(500).send({
       message: "Failed to insert coach details due to a server error.",
     });
@@ -692,12 +720,12 @@ app.get("/api/coach-details", authenticateToken, async (req, res) => {
     });
   }
   const sqlQuery = `
-        SELECT coach_id,
+         SELECT coach_id,
                coach_name,
                phone_numbers,
                salary,
                email,
-               address,
+               location,
                week_salary,
                category,
                status
@@ -747,7 +775,7 @@ app.put("/api/coaches-update/:id", async (req, res) => {
       coach_name,
       phone_numbers,
       email,
-      address,
+      location,
       salary,
       week_salary,
       active,
@@ -772,7 +800,7 @@ SET
   coach_name = $1,
   phone_numbers = $2,
   email = $3,
-  address = $4,
+  location = $4,
   salary = $5,
   week_salary = $6,
   active = $7,
@@ -785,7 +813,7 @@ RETURNING "coach_id", "coach_name", "status";`;
       coach_name, // $1
       phone_numbers, // $2
       email, // $3
-      address, // $4
+      location, // $4
       numericSalary, // $5
       numericWeekSalary, // $6
       isActive, // $7
@@ -856,9 +884,13 @@ app.put("/api/coaches-deactivate/:coach_id", async (req, res) => {
 
 // 4. API Endpoint to fetch player data
 app.get("/api/players-agssign", authenticateToken, async (req, res) => {
-  const tenantId = req.user.tenant_id;
+  const tenantId = req.user && req.user.tenant_id;
+  if (!tenantId) {
+    console.warn("/api/players-agssign: tenant_id missing on authenticated user", { user: req.user });
+    return res.status(403).json({ error: "Forbidden: Tenant not resolved for this user." });
+  }
   const sqlQuery = `
-        SELECT player_id, id, name, coach_name, coach_id
+        SELECT player_id, id, name, coach_name, ''::text AS coach_id
         FROM cd.player_details
         WHERE tenant_id = $1 AND active = TRUE
         ORDER BY player_id, id ASC;
@@ -884,79 +916,56 @@ app.get("/api/players-agssign", authenticateToken, async (req, res) => {
 app.post("/api/update-coach", authenticateToken, async (req, res) => {
   const {
     coach_name: incomingCoachName,
-    coach_id,
+    coach_id, 
     player_id,
     id,
   } = req.body || {};
+  
   const tenant_id = req.user && req.user.tenant_id;
-
-  try {
-    const safe = {
-      coach_name: incomingCoachName
-        ? String(incomingCoachName).slice(0, 100)
-        : null,
-      coach_id: coach_id,
-      player_id: player_id,
-      id: id,
-      tenant_id: tenant_id,
-    };
-    console.log("[/api/update-coach] payload:", safe);
-  } catch (e) {
-    console.warn("[/api/update-coach] failed to log payload", e && e.message);
-  }
+  console.log("[/api/update-coach] Attempting update for Player:", player_id, "with Coach ID:", coach_id);
 
   if (!tenant_id) {
-    return res
-      .status(403)
-      .json({ error: "Forbidden: Tenant ID missing from token." });
+    return res.status(403).json({ error: "Forbidden: Tenant ID missing." });
   }
+  const numericId = id ? Number(id) : NaN;
+  const playerIdValue = player_id ? String(player_id) : "";
 
-  const numericId = id !== undefined && id !== null ? Number(id) : NaN;
-  if (isNaN(numericId) || numericId <= 0) {
-    return res
-      .status(400)
-      .json({ error: "Invalid or missing numeric field: id." });
+  if (isNaN(numericId) || !playerIdValue) {
+    return res.status(400).json({ error: "Missing required fields: id or player_id." });
   }
-
-  const playerIdValue =
-    player_id !== undefined && player_id !== null ? String(player_id) : "";
-  if (!playerIdValue) {
-    return res
-      .status(400)
-      .json({ error: "Missing required field: player_id." });
-  }
-  
-  const numericCoachId =
-    coach_id !== undefined && coach_id !== null ? Number(coach_id) : NaN;
 
   try {
+    let resolvedCoachId = coach_id;
+    let resolvedCoachName = incomingCoachName;
+
     let coachCheck;
-    if (!isNaN(numericCoachId)) {
+    if (coach_id && !isNaN(Number(coach_id))) {
       coachCheck = await pool.query(
         `SELECT coach_id, coach_name FROM cd.coaches_details WHERE coach_id = $1 AND tenant_id = $2 LIMIT 1`,
-        [numericCoachId, tenant_id]
+        [Number(coach_id), tenant_id]
       );
-    } else {
+    } else if (incomingCoachName) {
       coachCheck = await pool.query(
-        `SELECT coach_id, coach_name FROM cd.coaches_details WHERE coach_id::text = $1 AND tenant_id = $2 LIMIT 1`,
-        [String(coach_id), tenant_id]
+        `SELECT coach_id, coach_name FROM cd.coaches_details WHERE LOWER(coach_name) = LOWER($1) AND tenant_id = $2 LIMIT 1`,
+        [String(incomingCoachName), tenant_id]
       );
     }
 
-    if (coachCheck.rowCount === 0) {
-      return res
-        .status(404)
-        .json({ error: "Selected coach not found for your tenant." });
+    if (coachCheck && coachCheck.rowCount > 0) {
+      resolvedCoachId = coachCheck.rows[0].coach_id;
+      resolvedCoachName = coachCheck.rows[0].coach_name;
+    } else {
+      return res.status(404).json({ error: "Coach not found in your organization." });
     }
 
-    const resolvedCoachName = coachCheck.rows[0].coach_name;
-    const resolvedCoachId = coachCheck.rows[0].coach_id;
-
+    // Note: If this fails with "coach_code" error, you MUST check your DB triggers.
     const sqlQuery = `
         UPDATE cd.player_details
         SET coach_name = $1,
             coach_id = $2
-        WHERE player_id = $3 AND id = $4 AND tenant_id = $5
+        WHERE player_id = $3 
+          AND id = $4 
+          AND tenant_id = $5
         RETURNING *;
     `;
 
@@ -971,22 +980,19 @@ app.post("/api/update-coach", authenticateToken, async (req, res) => {
     const result = await pool.query(sqlQuery, values);
 
     if (result.rowCount === 0) {
-      return res.status(404).json({
-        message:
-          "No player record found matching the criteria for update (check IDs and tenant).",
-      });
+      return res.status(404).json({ error: "Player record not found." });
     }
 
     return res.status(200).json({
       message: "Coach assigned successfully.",
-      updatedRows: result.rowCount,
       player: result.rows[0],
     });
+
   } catch (err) {
-    console.error("Database update error (/api/update-coach):", err);
+    console.error("SQL Error Details:", err.message);
     return res.status(500).json({
-      error: "Failed to update coach assignment.",
-      details: err.message,
+      error: "Database error during assignment.",
+      details: err.message, // This helps you see if a trigger is causing the 'coach_code' error
     });
   }
 });
@@ -1056,7 +1062,6 @@ app.get("/api/venues-Details", authenticateToken, async (req, res) => {
     client.release();
   }
 });
-
 
 // Apply the authentication middleware to secure the route
 app.post("/api/venue-add", authenticateToken, async (req, res) => {
@@ -1271,238 +1276,241 @@ ORDER BY
 // ---------------------------------------------
 // Attendance Recording Endpoint
 // ---------------------------------------------
-app.post("/api/attendance", async (req, res) => {
-  let { playerId, attendanceDate, isPresent, coachId } = req.body || {};
+app.post("/api/attendance", authenticateToken, async (req, res) => {
+  const tenantId = req.user?.tenantId; 
+  const authenticatedUserId = req.user?.userId;
+  let { 
+    playerId, 
+    attendanceDate, 
+    isPresent, 
+    coachId, 
+    latitude, 
+    longitude, 
+    locationAddress, 
+    timezone 
+  } = req.body || {};
 
-  // Log incoming payload for diagnostics
-  console.debug("/api/attendance payload:", {
-    playerId,
-    attendanceDate,
-    isPresent,
-    coachId,
-  });
+  console.debug("/api/attendance payload:", { playerId, attendanceDate, isPresent, coachId, latitude, longitude });
 
-  // Basic presence validation
-  if (
-    !playerId ||
-    !attendanceDate ||
-    isPresent === undefined ||
-    coachId === undefined
-  ) {
-    return res
-      .status(400)
-      .json({
-        error:
-          "Missing required attendance data. Required: playerId, attendanceDate, isPresent, coachId.",
-      });
+  if (!playerId || !attendanceDate || isPresent === undefined) {
+    return res.status(400).json({
+      error: "Missing required data. Required: playerId, attendanceDate, isPresent.",
+    });
   }
-
-  // Normalize boolean for isPresent
+  
   if (typeof isPresent === "string") {
     isPresent = isPresent.toLowerCase() === "true";
   } else {
     isPresent = Boolean(isPresent);
   }
 
-  // Validate attendanceDate (expecting YYYY-MM-DD or ISO string)
   const parsedDate = new Date(attendanceDate);
   if (Number.isNaN(parsedDate.getTime())) {
-    return res
-      .status(400)
-      .json({
-        error:
-          "Invalid attendanceDate. Expected a valid date string (e.g., YYYY-MM-DD).",
-        received: attendanceDate,
-      });
+    return res.status(400).json({
+      error: "Invalid attendanceDate format (YYYY-MM-DD).",
+      received: attendanceDate,
+    });
   }
 
-  // Resolve coachId to numeric DB id (allow numeric or textual identifiers)
-  let numericCoachId = Number(coachId);
-  if (isNaN(numericCoachId)) {
-    // attempt lookup by textual identifier or coach name
-    try {
+  let numericCoachId = Number(coachId || authenticatedUserId);
+
+  try {
+    if (isNaN(numericCoachId)) {
       const lookup = await pool.query(
-        `SELECT coach_id FROM cd.coaches_details WHERE coach_id::text = $1 OR coach_name = $1 LIMIT 1;`,
+        `SELECT coach_id FROM cd.coaches_details WHERE coach_name = $1 LIMIT 1;`,
         [String(coachId).trim()]
       );
-      if (lookup.rows && lookup.rows.length > 0) {
+      if (lookup.rows.length > 0) {
         numericCoachId = lookup.rows[0].coach_id;
       } else {
-        return res
-          .status(400)
-          .json({
-            error: `Could not resolve coachId to a numeric id: ${coachId}`,
-          });
+        return res.status(400).json({ error: `Could not find coach: ${coachId}` });
       }
-    } catch (lookupErr) {
-      console.error("Error resolving coachId for attendance:", lookupErr);
-      return res
-        .status(500)
-        .json({
-          error: "Failed to resolve coach identifier.",
-          details: lookupErr.message,
-        });
     }
-  }
 
-  // Normalize playerId to string form (player_id in DB is typically textual like 'FA2025...')
-  const normalizedPlayerId =
-    playerId === null || playerId === undefined
-      ? null
-      : String(playerId).trim();
+    const formattedDate = parsedDate.toISOString().split("T")[0];
+    const normalizedPlayerId = String(playerId).trim();
 
-  const queryText = `
-    INSERT INTO cd.attendance_sheet 
-    (player_id, attendance_date, is_present, recorded_by_coach_id)
-    VALUES($1, $2, $3, $4)
-    RETURNING *;
-  `;
-  const queryValues = [
-    normalizedPlayerId,
-    parsedDate.toISOString().split("T")[0],
-    isPresent,
-    numericCoachId,
-  ];
+    const queryText = `
+      INSERT INTO cd.attendance_sheet 
+        (tenant_id, player_id, attendance_date, is_present, recorded_by_coach_id,
+         latitude, longitude, location_address, timezone, submitted_at)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW())
+      RETURNING *;
+    `;
 
-  console.debug("/api/attendance resolved values:", {
-    normalizedPlayerId,
-    attendanceDate: parsedDate.toISOString().split("T")[0],
-    isPresent,
-    numericCoachId,
-  });
-  try {
-    // Some schemas require an explicit attendance_id (no serial/default). Try to allocate one from a sequence if available.
-    let finalQueryText = queryText;
-    let finalQueryValues = queryValues;
-
-    // Attempt to fetch nextval from common sequence names
-    let attendanceId = null;
-    const seqCandidates = [
-      "cd.attendance_sheet_attendance_id_seq",
-      "attendance_sheet_attendance_id_seq",
-      "cd.attendance_id_seq",
-      "attendance_id_seq",
+    const queryValues = [
+      tenantId,           // $1
+      normalizedPlayerId, // $2
+      formattedDate,      // $3
+      isPresent,          // $4
+      numericCoachId,     // $5
+      latitude || null,   // $6
+      longitude || null,  // $7
+      locationAddress || "Not provided", // $8
+      timezone || "UTC"   // $9
     ];
-    for (const seqName of seqCandidates) {
-      try {
-        const seqRes = await pool.query(`SELECT nextval('${seqName}') as v`);
-        if (seqRes && seqRes.rows && seqRes.rows[0] && seqRes.rows[0].v) {
-          attendanceId = seqRes.rows[0].v;
-          console.debug(
-            `/api/attendance allocated attendanceId from sequence ${seqName}:`,
-            attendanceId
-          );
-          break;
-        }
-      } catch (seqErr) {
-        // ignore and try next
-      }
-    }
 
-    if (attendanceId !== null) {
-      finalQueryText = `
-        INSERT INTO cd.attendance_sheet (attendance_id, player_id, attendance_date, is_present, recorded_by_coach_id)
-        VALUES($1, $2, $3, $4, $5)
-        RETURNING *;
-      `;
-      finalQueryValues = [attendanceId, ...queryValues];
-    }
+    const result = await pool.query(queryText, queryValues);
 
-    const result = await pool.query(finalQueryText, finalQueryValues);
     res.status(201).json({
       message: "Attendance successfully recorded.",
       data: result.rows[0],
     });
+
   } catch (err) {
-    console.error("Error executing attendance insert query:", err);
-    if (err && err.code === "22P02") {
-      return res.status(400).json({
-        error:
-          "Data type mismatch when inserting attendance. Check numeric fields.",
-        details: err.message,
-      });
+    console.error("Database Error:", err);
+    
+    if (err.code === "23505") { 
+        return res.status(409).json({ error: "Attendance already exists for this player on this date." });
     }
 
     return res.status(500).json({
-      error: "Failed to record attendance due to server error.",
+      error: "Failed to record attendance.",
       details: err.message,
     });
   }
 });
 
-// ---------------------------------------------
 //Fetches player details, attendance percentage, and recent activities for a player guardian
-app.get("/api/player-details/:email", authenticateToken, async (req, res) => {
-  const parentEmail = req.params.email;
-  if (req.user.role !== "parent" || req.user.email !== parentEmail) {
+app.get("/api/player-details/:email/:playerId", authenticateToken, async (req, res) => {
+  const { email: parentEmail, playerId } = req.params;
+  if (req.user.role !== "parent" || req.user.email.toLowerCase().trim() !== parentEmail.toLowerCase().trim()) {
     return res.status(403).json({
-      error: "Forbidden: Token role or email does not match requested data.",
+      error: "Forbidden: You do not have permission to access this data.",
     });
-  }
-
-  if (!parentEmail) {
-    return res.status(400).json({ error: "Missing parent email parameter." });
   }
 
   try {
     const sqlQuery = `
-            SELECT
-                pd.player_id,
-                pd.name,
-                pd.age,
-                pd.center_name AS center,
-                pd.coach_name AS coach,
-                pd.category as position,
-                pd.phone_no,
-                pd.email_id AS player_email,
-                COALESCE(
-                    CAST(SUM(CASE WHEN a.is_present = TRUE THEN 1 ELSE 0 END) AS NUMERIC) * 100 /
-                    NULLIF(COUNT(a.attendance_id), 0),
-                    0
-                ) AS attendance_percentage,
-                (
-                    SELECT json_agg(
-                        json_build_object(
-                            'date', a_recent.attendance_date,
-                            'activity', 'Training Session',
-                            'status', CASE WHEN a_recent.is_present THEN 'Present' ELSE 'Absent' END
-                        )
-                        ORDER BY a_recent.attendance_date DESC
-                       
-                    )
-                    FROM cd.attendance_sheet a_recent
-                    WHERE a_recent.player_id = pd.player_id
-                ) AS recent_activities_json
-            FROM
-                cd.player_details pd
-            LEFT JOIN
-                cd.attendance_sheet a ON pd.player_id = a.player_id
-            INNER JOIN
-                cd.users_login ul ON ul.email = pd.guardian_email_id
-            WHERE
-                -- FIX: Use LOWER(TRIM()) for robust case-insensitive, whitespace-safe comparison
-                LOWER(TRIM(ul.email)) = LOWER(TRIM($1)) 
-                AND ul.role = 'parent'
-            GROUP BY
-                pd.player_id, pd.name, pd.age, pd.center_name, pd.coach_name, pd.category, pd.phone_no, pd.email_id;
-        `;
+      SELECT
+          pd.player_id,
+          pd.name,
+          pd.age,
+          pd.center_name AS center,
+          pd.coach_name AS coach,
+          pd.category AS position,
+          pd.phone_no,
+          pd.email_id AS player_email,
+          COALESCE(
+              CAST(SUM(CASE WHEN a.is_present = TRUE THEN 1 ELSE 0 END) AS NUMERIC) * 100 /
+              NULLIF(COUNT(a.attendance_id), 0),
+              0
+          ) AS attendance_percentage,
+          (
+              SELECT json_agg(activity_list)
+              FROM (
+                  SELECT 
+                      a_recent.attendance_date AS date,
+                      'Training Session' AS activity,
+                      CASE WHEN a_recent.is_present THEN 'Present' ELSE 'Absent' END AS status
+                  FROM cd.attendance_sheet a_recent
+                  WHERE a_recent.player_id = pd.player_id
+                    AND a_recent.attendance_date >= CURRENT_DATE - INTERVAL '1 month'
+                  ORDER BY a_recent.attendance_date DESC
+              ) activity_list
+          ) AS recent_activities_json
+      FROM cd.player_details pd
+      LEFT JOIN cd.attendance_sheet a 
+          ON pd.player_id = a.player_id
+      INNER JOIN cd.users_login ul 
+          ON LOWER(TRIM(ul.email)) = LOWER(TRIM(pd.guardian_email_id))
+      WHERE
+          LOWER(TRIM(ul.email)) = LOWER(TRIM($1))
+          AND ul.role = 'parent'
+          AND pd.player_id = $2
+      GROUP BY
+          pd.player_id,
+          pd.name,
+          pd.age,
+          pd.center_name,
+          pd.coach_name,
+          pd.category,
+          pd.phone_no,
+          pd.email_id;
+    `;
+
+    const result = await pool.query(sqlQuery, [parentEmail, playerId]);
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: "No player found for this parent." });
+    }
+    res.json(result.rows[0]);
+
+  } catch (err) {
+    console.error("Error executing query:", err.message);
+    res.status(500).json({ error: "Internal server error while fetching player data." });
+  }
+});
+
+// New: Fetch all players for a guardian (by guardian email)
+app.get("/api/player-details-by-guardian/:email", authenticateToken, async (req, res) => {
+  const { email: parentEmail } = req.params;
+  if (req.user.role !== "parent" || req.user.email.toLowerCase().trim() !== parentEmail.toLowerCase().trim()) {
+    return res.status(403).json({ error: "Forbidden: You do not have permission to access this data." });
+  }
+
+  try {
+    const sqlQuery = `
+      SELECT
+          pd.player_id,
+          pd.name,
+          pd.age,
+          pd.center_name AS center,
+          pd.coach_name AS coach,
+          pd.category AS position,
+          pd.phone_no,
+          pd.email_id AS player_email,
+          COALESCE(
+              CAST(SUM(CASE WHEN a.is_present = TRUE THEN 1 ELSE 0 END) AS NUMERIC) * 100 /
+              NULLIF(COUNT(a.attendance_id), 0),
+              0
+          ) AS attendance_percentage,
+          (
+              SELECT json_agg(activity_list)
+              FROM (
+                  SELECT 
+                      a_recent.attendance_date AS date,
+                      'Training Session' AS activity,
+                      CASE WHEN a_recent.is_present THEN 'Present' ELSE 'Absent' END AS status
+                  FROM cd.attendance_sheet a_recent
+                  WHERE a_recent.player_id = pd.player_id
+                    AND a_recent.attendance_date >= CURRENT_DATE - INTERVAL '1 month'
+                  ORDER BY a_recent.attendance_date DESC
+              ) activity_list
+          ) AS recent_activities_json
+      FROM cd.player_details pd
+      LEFT JOIN cd.attendance_sheet a ON pd.player_id = a.player_id
+      INNER JOIN cd.users_login ul ON LOWER(TRIM(ul.email)) = LOWER(TRIM(pd.guardian_email_id))
+      WHERE LOWER(TRIM(ul.email)) = LOWER(TRIM($1))
+        AND ul.role = 'parent'
+      GROUP BY
+          pd.player_id,
+          pd.name,
+          pd.age,
+          pd.center_name,
+          pd.coach_name,
+          pd.category,
+          pd.phone_no,
+          pd.email_id
+      ORDER BY pd.player_id ASC;
+    `;
 
     const result = await pool.query(sqlQuery, [parentEmail]);
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: "No players found for this parent." });
+    }
+    // Return array of player objects
     res.json(result.rows);
+
   } catch (err) {
-    console.error("Error executing query:", err.stack);
-    res
-      .status(500)
-      .json({ error: "Internal server error while fetching player data." });
+    console.error("Error executing query (by guardian):", err.message);
+    res.status(500).json({ error: "Internal server error while fetching player data." });
   }
 });
 
 app.use(express.json());
 
 //fech data registrations API and code
-// This route is protected by the authenticateUser middleware
 app.get("/api/registrations", authenticateToken, async (req, res) => {
-  // Prefer tenant_id set by middleware, but fall back to common locations
   const tenant_id =
     req.tenant_id ||
     req.user?.tenant_id ||
@@ -1751,7 +1759,7 @@ LEFT JOIN
 ON 
     p.player_id = a.player_id
 WHERE 
-    p.coach_id = $1
+    p.coach_code = $1
 GROUP BY 
     p.player_id, p.name, p.age, p.category, p.active
 ORDER BY 
@@ -1821,7 +1829,7 @@ app.get("/api/sessions-data/:coachId", async (req, res) => {
 });
 
 // Assuming 'app' is your Express app instance:
-app.post("/api/sessions-insert", async (req, res) => {
+app.post("/api/sessions-insert", authenticateToken, async (req, res) => {
   try {
     let {
       coach_id,
@@ -1834,78 +1842,36 @@ app.post("/api/sessions-insert", async (req, res) => {
       status,
       active,
     } = req.body ?? {};
+
+    // FALLBACK: If coach_id isn't in body, try to get it from the authenticated user token
+    if (!coach_id && req.user) {
+        coach_id = req.user.coach_id || req.user.id;
+    }
+
     if (!coach_id) {
       return res.status(400).json({ error: "Invalid or missing coach_id" });
     }
-    let resolvedCoachId = Number(coach_id);
+
+    // Logic to ensure coach_id is a clean number
+    let resolvedCoachId = Number(String(coach_id).replace(/\D/g, ""));
 
     if (isNaN(resolvedCoachId)) {
-      const lookupVal = String(coach_id).trim();
-      const lookupQry = `SELECT coach_id FROM cd.coaches_details WHERE coach_id = $1 OR coach_name = $1 LIMIT 1;`;
-      try {
-        const lookupRes = await pool.query(lookupQry, [lookupVal]);
-        if (lookupRes.rows && lookupRes.rows.length > 0) {
-          const dbCoachId = lookupRes.rows[0].coach_id;
-          const numericPart = String(dbCoachId).replace(/\D/g, "");
-          resolvedCoachId = Number(numericPart);
-          if (isNaN(resolvedCoachId)) {
-            console.error(`DB returned non-numeric ID for coach: ${dbCoachId}`);
-            return res.status(400).json({
-              error: `Database returned invalid numeric coach_id for identifier: ${lookupVal}`,
-            });
-          }
-        } else {
-          return res.status(400).json({
-            error: `Could not resolve numeric coach_id from provided identifier: ${lookupVal}`,
-          });
-        }
-      } catch (lookupErr) {
-        console.error("Error resolving coach identifier:", lookupErr);
-        return res
-          .status(500)
-          .json({ error: "Failed to resolve coach identifier" });
-      }
+      return res.status(400).json({ error: "Coach ID must be a valid numeric value." });
     }
 
-    coach_id = Number(resolvedCoachId);
-    if (isNaN(coach_id)) {
-      console.error(
-        "Final coach_id is NaN before DB query. Initial value:",
-        req.body.coach_id
-      );
-      return res
-        .status(400)
-        .json({ error: "Resolved coach_id is not a valid number." });
-    }
-    if (!coach_name || typeof coach_name !== "string") {
-      return res.status(400).json({ error: "Invalid or missing coach_name" });
-    }
-    if (!day_of_week || typeof day_of_week !== "string") {
-      return res.status(400).json({ error: "Invalid or missing day_of_week" });
-    }
-    if (!start_time || !end_time) {
-      return res
-        .status(400)
-        .json({ error: "start_time and end_time are required" });
-    }
+    // Default Values
+    status = (typeof status === "string" && status.trim() !== "") ? status.trim() : "Upcoming";
+    active = active !== undefined ? (String(active).toLowerCase() === "true") : true;
 
-    status =
-      typeof status === "string" && status.trim() !== ""
-        ? status.trim()
-        : "Upcoming";
-
-    if (active === undefined || active === null) {
-      active = true;
-    } else if (typeof active === "string") {
-      active = active.toLowerCase() === "true";
-    } else {
-      active = Boolean(active);
-    }
-
-    const queryText = `INSERT INTO cd.training_sessions (coach_id, coach_name, day_of_week, start_time, end_time, group_category, location, status, active) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *;`;
+    const queryText = `
+      INSERT INTO cd.training_sessions 
+      (coach_id, coach_name, day_of_week, start_time, end_time, group_category, location, status, active) 
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) 
+      RETURNING *;
+    `;
 
     const values = [
-      coach_id,
+      resolvedCoachId,
       coach_name,
       day_of_week,
       start_time,
@@ -1915,14 +1881,13 @@ app.post("/api/sessions-insert", async (req, res) => {
       status,
       active,
     ];
-    const { rows } = await pool.query(queryText, values);
 
+    const { rows } = await pool.query(queryText, values);
     return res.status(201).json(rows[0]);
+
   } catch (error) {
-    console.error("Error adding new training session:", error);
-    return res
-      .status(500)
-      .json({ error: "Internal Server Error", details: error.message });
+    console.error("Error adding session:", error);
+    return res.status(500).json({ error: "Internal Server Error", details: error.message });
   }
 });
 
@@ -2033,14 +1998,16 @@ app.delete("/api/sessions/:session_id", async (req, res) => {
 });
 
 //Payment details API and code
-app.get('/api/payments', authenticateToken, async (req, res) => {
-    const tenant_id = req.user?.tenant_id ?? req.user?.tenant ?? null;
+app.get("/api/payments", authenticateToken, async (req, res) => {
+  const tenant_id = req.user?.tenant_id ?? req.user?.tenant ?? null;
 
-    if (!tenant_id) {
-        return res.status(401).json({ message: 'Authentication failed: Tenant ID missing.' });
-    }
+  if (!tenant_id) {
+    return res
+      .status(401)
+      .json({ message: "Authentication failed: Tenant ID missing." });
+  }
 
-    const queryText = `
+  const queryText = `
         SELECT 
             payment_id,
             full_name,
@@ -2055,64 +2022,91 @@ app.get('/api/payments', authenticateToken, async (req, res) => {
         ORDER BY payment_id DESC;
     `;
 
-    try {
-        const result = await pool.query(queryText, [tenant_id]);
-        return res.status(200).json({
-            message: 'Payment records retrieved successfully.',
-            data: result.rows,
-        });
-
-    } catch (err) {
-        console.error('Database retrieval error (payments):', err.stack || err.message || err);
-        return res.status(500).json({ message: 'Error retrieving payment details.', error: err.message });
-    }
+  try {
+    const result = await pool.query(queryText, [tenant_id]);
+    return res.status(200).json({
+      message: "Payment records retrieved successfully.",
+      data: result.rows,
+    });
+  } catch (err) {
+    console.error(
+      "Database retrieval error (payments):",
+      err.stack || err.message || err
+    );
+    return res
+      .status(500)
+      .json({
+        message: "Error retrieving payment details.",
+        error: err.message,
+      });
+  }
 });
 
-//payment insert the data 
-app.post('/api/payment', authenticateToken, async (req, res) => {
-  const tenant_id = req.user?.tenant_id ?? req.user?.tenant ?? null;    
-  console.log(`A user is inserting payment details for tenant ${tenant_id}.`);    
-  const { full_name, email, phone, amount_paid, hire_date, end_date } = req.body || {};
-  if (!full_name || !email || amount_paid == null || !hire_date || !end_date) {
-    return res.status(400).json({ message: 'Missing required payment fields.' });
-  }
-  const amount = Number(amount_paid);
-  if (Number.isNaN(amount) || amount < 0) {
-    return res.status(400).json({ message: 'Invalid amount_paid value.' });
-  }  
-  const hireDateStr = String(hire_date);
-  const endDateStr = String(end_date);
+//payment insert the data
+app.post("/api/payment", authenticateToken, async (req, res) => {
+  const tenant_id = req.user?.tenant_id ?? req.user?.tenant ?? null;
+  console.log(`A user is inserting payment details for tenant ${tenant_id}.`);
+  const { full_name, email, phone, amount_paid, hire_date, end_date } =
+    req.body || {};
+  if (!full_name || !email || amount_paid == null || !hire_date || !end_date) {
+    return res
+      .status(400)
+      .json({ message: "Missing required payment fields." });
+  }
+  const amount = Number(amount_paid);
+  if (Number.isNaN(amount) || amount < 0) {
+    return res.status(400).json({ message: "Invalid amount_paid value." });
+  }
+  const hireDateStr = String(hire_date);
+  const endDateStr = String(end_date);
 
-  const queryText = `
+  const queryText = `
     INSERT INTO cd.payment_details (tenant_id, full_name, email, phone, amount_paid, hire_date, end_date)
     VALUES ($1, $2, $3, $4, $5, $6, $7)
     RETURNING *;
   `;
 
-  const values = [tenant_id, full_name, email, phone, amount, hireDateStr, endDateStr];
+  const values = [
+    tenant_id,
+    full_name,
+    email,
+    phone,
+    amount,
+    hireDateStr,
+    endDateStr,
+  ];
 
-  try {
-    const result = await pool.query(queryText, values);
-    return res.status(201).json({
-      message: 'Payment details inserted successfully.',
-      requester: { tenant_id }, 
-      data: result.rows[0],
-    });
-  } catch (err) {
-    console.error('Database insertion error (payment):', err.stack || err.message || err);
-    return res.status(500).json({ message: 'Error inserting payment details.', error: err.message });
-  }
+  try {
+    const result = await pool.query(queryText, values);
+    return res.status(201).json({
+      message: "Payment details inserted successfully.",
+      requester: { tenant_id },
+      data: result.rows[0],
+    });
+  } catch (err) {
+    console.error(
+      "Database insertion error (payment):",
+      err.stack || err.message || err
+    );
+    return res
+      .status(500)
+      .json({
+        message: "Error inserting payment details.",
+        error: err.message,
+      });
+  }
 });
 
-
 // Example: GET /api/payment_details?login_id=USER-12345
-app.get('/api/payment_details',authenticateToken, async (req, res) => {
+app.get("/api/payment_details", authenticateToken, async (req, res) => {
   // Get the login_id from the query parameters (e.g., ?login_id=...)
   const loginId = req.query.login_id;
 
   // Check if loginId was provided
   if (!loginId) {
-    return res.status(400).json({ error: 'Missing required query parameter: login_id' });
+    return res
+      .status(400)
+      .json({ error: "Missing required query parameter: login_id" });
   }
 
   // The SQL query with the parameter placeholder $1
@@ -2133,23 +2127,25 @@ app.get('/api/payment_details',authenticateToken, async (req, res) => {
   try {
     const result = await pool.query(queryText, [loginId]);
     res.json(result.rows);
-
   } catch (err) {
-    console.error('Error executing query', err.stack);
-    res.status(500).json({ error: 'Database query failed', details: err.message });
+    console.error("Error executing query", err.stack);
+    res
+      .status(500)
+      .json({ error: "Database query failed", details: err.message });
   }
 });
 
-
 // The middleware runs BEFORE the route handler (async (req, res) => { ... })
-app.get('/api/payments-details', authenticateToken, async (req, res) => {
-    const tenant_id = req.user?.tenant_id ?? req.user?.tenant ?? null;
+app.get("/api/payments-details", authenticateToken, async (req, res) => {
+  const tenant_id = req.user?.tenant_id ?? req.user?.tenant ?? null;
 
-    if (!tenant_id) {
-        return res.status(401).json({ message: 'Authentication failed: Tenant ID missing.' });
-    }
+  if (!tenant_id) {
+    return res
+      .status(401)
+      .json({ message: "Authentication failed: Tenant ID missing." });
+  }
 
-    const queryText = `
+  const queryText = `
         SELECT
           tenant_id,
           payment_id,
@@ -2162,23 +2158,30 @@ app.get('/api/payments-details', authenticateToken, async (req, res) => {
         ORDER BY payment_id DESC;
     `;
 
-    try {
-        const result = await pool.query(queryText, [tenant_id]);
-        return res.status(200).json({
-            message: 'Payment records retrieved successfully.',
-            data: result.rows,
-        });
-
-    } catch (err) {
-        console.error('Database retrieval error (payments):', err.stack || err.message || err);
-        return res.status(500).json({ message: 'Error retrieving payment details.', error: err.message });
-    }
+  try {
+    const result = await pool.query(queryText, [tenant_id]);
+    return res.status(200).json({
+      message: "Payment records retrieved successfully.",
+      data: result.rows,
+    });
+  } catch (err) {
+    console.error(
+      "Database retrieval error (payments):",
+      err.stack || err.message || err
+    );
+    return res
+      .status(500)
+      .json({
+        message: "Error retrieving payment details.",
+        error: err.message,
+      });
+  }
 });
 
 // Apply the authentication middleware to the route
-app.get('/api/payments/my-details', authenticateToken, async (req, res) => {
-    const tenantId = req.user.tenant_id;
-    const sqlQuery = `
+app.get("/api/payments/my-details", authenticateToken, async (req, res) => {
+  const tenantId = req.user.tenant_id;
+  const sqlQuery = `
         SELECT
             tenant_id,
             payment_id,
@@ -2196,24 +2199,24 @@ app.get('/api/payments/my-details', authenticateToken, async (req, res) => {
         ORDER BY
             payment_id DESC;
     `;
-    
-    try {
-        const { rows } = await pool.query(sqlQuery, [tenantId]);
-        res.json({
-            message: `Payment details for tenant_id: ${tenantId}`,
-            data: rows
-        });
-    } catch (err) {
-        console.error('Database query error:', err);
-        res.status(500).json({ 
-            error: 'Failed to retrieve payment details.',
-            details: err.message
-        });
-    }
+
+  try {
+    const { rows } = await pool.query(sqlQuery, [tenantId]);
+    res.json({
+      message: `Payment details for tenant_id: ${tenantId}`,
+      data: rows,
+    });
+  } catch (err) {
+    console.error("Database query error:", err);
+    res.status(500).json({
+      error: "Failed to retrieve payment details.",
+      details: err.message,
+    });
+  }
 });
 
 //delete the payment details API and code
-app.put('/api/payment/deactivate/:id', async (req, res) => {
+app.put("/api/payment/deactivate/:id", async (req, res) => {
   const paymentId = req.params.id;
   const queryText = `
     UPDATE cd.payment_details
@@ -2222,30 +2225,31 @@ app.put('/api/payment/deactivate/:id', async (req, res) => {
   `;
   const queryParams = [paymentId];
   try {
-    const result = await pool.query(queryText, queryParams); 
+    const result = await pool.query(queryText, queryParams);
     if (result.rowCount > 0) {
       res.status(200).json({
         message: `Payment method with ID ${paymentId} has been successfully deactivated.`,
-        updatedRows: result.rowCount
+        updatedRows: result.rowCount,
       });
     } else {
       res.status(404).json({
-        error: `Payment method with ID ${paymentId} not found.`
+        error: `Payment method with ID ${paymentId} not found.`,
       });
     }
   } catch (err) {
-    console.error('Error executing update query', err.stack);
+    console.error("Error executing update query", err.stack);
     res.status(500).json({
-      error: 'An internal server error occurred while deactivating the payment method.'
+      error:
+        "An internal server error occurred while deactivating the payment method.",
     });
   }
 });
 
 //edit the payment details
-app.get('/api/payment/:id', async (req, res) => {
+app.get("/api/payment/:id", async (req, res) => {
   const paymentId = req.params.id;
   if (!paymentId || isNaN(paymentId)) {
-    return res.status(400).json({ error: 'Invalid or missing payment ID.' });
+    return res.status(400).json({ error: "Invalid or missing payment ID." });
   }
   const queryText = `
     SELECT 
@@ -2265,21 +2269,27 @@ app.get('/api/payment/:id', async (req, res) => {
   try {
     const result = await pool.query(queryText, [paymentId]);
     if (result.rows.length === 0) {
-      return res.status(404).json({ error: `Payment record with ID ${paymentId} not found or is inactive.` });
+      return res
+        .status(404)
+        .json({
+          error: `Payment record with ID ${paymentId} not found or is inactive.`,
+        });
     }
     res.json(result.rows[0]);
-
   } catch (error) {
     console.error(`Database query error fetching payment ${paymentId}:`, error);
-    res.status(500).json({ error: 'Internal server error while fetching payment details.' });
+    res
+      .status(500)
+      .json({ error: "Internal server error while fetching payment details." });
   }
 });
 
 // Update payment details API and code
-app.put('/api/payment/:id', async (req, res) => {
-    const paymentId = req.params.id;
-    const { full_name, email, phone, amount_paid, hire_date, end_date, status } = req.body;
-    const queryText = `
+app.put("/api/payment/:id", async (req, res) => {
+  const paymentId = req.params.id;
+  const { full_name, email, phone, amount_paid, hire_date, end_date, status } =
+    req.body;
+  const queryText = `
         UPDATE cd.payment_details
         SET full_name = $1,
             email = $2,
@@ -2292,38 +2302,38 @@ app.put('/api/payment/:id', async (req, res) => {
         RETURNING *; -- RETURNING * sends the updated record back
     `;
 
-    const queryParams = [
-        full_name,
-        email,
-        phone,
-        amount_paid,
-        hire_date, 
-        end_date,  
-        status,
-        paymentId  
-    ];
+  const queryParams = [
+    full_name,
+    email,
+    phone,
+    amount_paid,
+    hire_date,
+    end_date,
+    status,
+    paymentId,
+  ];
 
-    try {
-        // Use the established Postgres pool instance
-        const result = await pool.query(queryText, queryParams);
-        if (result.rowCount > 0) {
-            res.status(200).json(result.rows[0]);
-        } else {
-            res.status(404).json({
-                error: `Payment record with ID ${paymentId} not found.`
-            });
-        }
-    } catch (err) {
-        console.error('Error executing payment update query:', err.stack);
-        res.status(500).json({
-            error: 'An internal server error occurred while updating the payment record.'
-        });
+  try {
+    // Use the established Postgres pool instance
+    const result = await pool.query(queryText, queryParams);
+    if (result.rowCount > 0) {
+      res.status(200).json(result.rows[0]);
+    } else {
+      res.status(404).json({
+        error: `Payment record with ID ${paymentId} not found.`,
+      });
     }
+  } catch (err) {
+    console.error("Error executing payment update query:", err.stack);
+    res.status(500).json({
+      error:
+        "An internal server error occurred while updating the payment record.",
+    });
+  }
 });
 
-
 // pending amount and paid amount API and code
-app.get('/api/payment-summary', authenticateToken, async (req, res) => {
+app.get("/api/payment-summary", authenticateToken, async (req, res) => {
   const tenantId = req.tenantId;
   const sqlQuery = `
    SELECT
@@ -2343,23 +2353,509 @@ ORDER BY
     const summary = result.rows[0];
 
     if (!summary) {
-        return res.status(404).json({ message: 'No payment summary found.' });
+      return res.status(404).json({ message: "No payment summary found." });
     }
     res.json({
-        tenant_id: tenantId,
-        total_paid_amount: parseFloat(summary.total_paid_amount) || 0,
-        total_pending_amount: parseFloat(summary.total_pending_amount) || 0,
+      tenant_id: tenantId,
+      total_paid_amount: parseFloat(summary.total_paid_amount) || 0,
+      total_pending_amount: parseFloat(summary.total_pending_amount) || 0,
+    });
+  } catch (err) {
+    console.error("Database query error:", err.stack);
+    res
+      .status(500)
+      .send("Internal Server Error while fetching payment summary.");
+  }
+});
+
+// GET Route for Locations
+app.get('/api/venues-drop', authenticateToken, async (req, res) => {
+  try {
+    const tenantId = req.user.tenant_id; 
+    const query = `
+      SELECT id, center_head 
+      FROM cd.venues_data
+      WHERE active = true AND tenant_id = $1
+      ORDER BY id DESC
+    `;
+    const result = await pool.query(query, [tenantId]);
+    res.json(result.rows);
+  } catch (err) {
+    console.error(err.message);
+    res.status(500).send("Server Error");
+  }
+});
+
+// 2. The API Route to fetch attendance by Coach ID
+app.get('/api/attendance-records/:coachId', async (req, res) => {
+    const coachId = req.params.coachId;
+
+    const query = `
+        SELECT 
+            pd.name,
+            at.player_id,
+            at.attendance_date,
+            CASE 
+                WHEN at.is_present THEN 'Present'
+                ELSE 'Absent'
+            END AS attendance_status,
+            pd.coach_name,
+            TO_CHAR(at.created_at, 'HH24:MI:SS') AS created_time
+        FROM cd.attendance_sheet at
+        INNER JOIN cd.player_details pd 
+            ON at.player_id = pd.player_id
+        WHERE at.recorded_by_coach_id = $1
+        ORDER BY at.created_at DESC;
+    `;
+
+    try {
+        const result = await pool.query(query, [coachId]);
+        
+        if (result.rows.length === 0) {
+            return res.status(404).json({ message: "No data found for this coach ID" });
+        }
+
+        res.status(200).json(result.rows);
+    } catch (err) {
+        console.error('Error executing query', err.stack);
+        res.status(500).json({ error: 'Internal Server Error' });
+    }
+});
+
+// 3. Protected Route to create a schedule event
+app.post('/api/schedule-addevents', authenticateToken, async (req, res) => {
+  const { 
+    tenant_id, 
+    title, 
+    event_type, 
+    event_date, 
+    event_time, 
+    duration, 
+    location, 
+    team, 
+    description 
+  } = req.body;
+  
+  const coach_id = req.user.id; 
+  const coach_name = req.user.name || req.user.email; 
+
+  const query = `
+    INSERT INTO cd.schedule_events (
+        tenant_id,
+        title,
+        event_type,
+        event_date,
+        event_time,
+        duration,
+        location,
+        team,
+        description,
+        coach_id,
+        coach_name
+    )
+    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+    RETURNING *;
+  `;
+
+  const values = [
+    tenant_id,
+    title,
+    event_type,
+    event_date,
+    event_time,
+    duration,
+    location,
+    team,
+    description,
+    coach_id,    
+    coach_name   
+  ];
+
+  try {
+    const result = await pool.query(query, values);
+    res.status(201).json({
+      success: true,
+      message: "Event scheduled successfully",
+      data: result.rows[0]
+    });
+  } catch (err) {
+    console.error("Database Error:", err.message);
+    res.status(500).json({ 
+      success: false, 
+      error: "Failed to insert schedule event" 
+    });
+  }
+});
+
+// fetch the event details API and code
+app.get('/api/events-fetch/:tenant_id/:coach_id', authenticateToken, async (req, res) => {
+  const { tenant_id, coach_id } = req.params;
+  if (!tenant_id || !coach_id) {
+    return res.status(400).json({ success: false, error: 'Missing tenant_id or coach_id' });
+  }
+
+  const queryText = `
+    SELECT 
+        id, 
+        tenant_id, 
+        title, 
+        event_type, 
+        event_date, 
+        event_time, 
+        duration, 
+        team, 
+        location, 
+        description, 
+        coach_name 
+    FROM cd.schedule_events
+    WHERE active = TRUE 
+    AND tenant_id = $1 
+    AND coach_id = $2
+    ORDER BY id DESC;
+  `;
+
+  try {
+    const values = [tenant_id, coach_id];
+    const result = await pool.query(queryText, values);
+    res.status(200).json({
+      success: true,
+      data: result.rows
+    });
+  } catch (err) {
+    console.error('DB Error:', err.message);
+    res.status(500).json({ 
+      success: false, 
+      error: 'Database error',
+      message: err.message 
+    });
+  }
+});
+
+//update the event details API and code
+app.put('/api/events-update/:id', authenticateToken, async (req, res) => {
+  const { id } = req.params;
+  const { 
+    title, 
+    event_type, 
+    team, 
+    event_date, 
+    event_time, 
+    duration, 
+    location, 
+    description, 
+    tenant_id: bodyTenantId
+  } = req.body;
+  // Accept tenant_id from request body, query param, or verified token
+  const tenant_id = bodyTenantId || req.query?.tenant_id || req.user?.tenant_id || null;
+
+  const queryText = `
+    UPDATE cd.schedule_events SET 
+      title = $1,    
+      event_type = $2,
+      team = $3,
+      event_date = $4,
+      event_time = $5,
+      duration = $6,
+      location = $7,
+      description = $8
+    WHERE id = $9 AND tenant_id = $10
+    RETURNING *;
+  `;
+
+  const values = [
+    title, 
+    event_type, 
+    team, 
+    event_date, 
+    event_time, 
+    duration, 
+    location, 
+    description, 
+    id, 
+    tenant_id
+  ];
+
+  try {
+    const result = await pool.query(queryText, values);
+
+    if (result.rowCount === 0) {
+      return res.status(404).json({ 
+        success: false, 
+        message: "Event not found or unauthorized" 
+      });
+    }
+
+    res.status(200).json({
+      success: true,
+      message: "Event updated successfully",
+      data: result.rows[0]
+    });
+  } catch (err) {
+    console.error('Update Error:', err.message);
+    res.status(500).json({ 
+      success: false, 
+      error: 'Database error',
+      message: err.message 
+    });
+  }
+});
+
+//delete the event details API and code
+app.delete('/api/events-delete/:id', authenticateToken, async (req, res) => {
+  const { id } = req.params;
+  // Accept tenant_id from body, query string, or authenticated token
+  const { tenant_id: bodyTenant } = req.body || {};
+  const tenant_id = bodyTenant || req.query?.tenant_id || req.user?.tenant_id || null;
+  const queryText = `
+    UPDATE cd.schedule_events 
+    SET active = FALSE 
+    WHERE id = $1 AND tenant_id = $2
+    RETURNING *;
+  `;
+
+  try {
+    const result = await pool.query(queryText, [id, tenant_id]);
+
+    if (result.rowCount === 0) {
+      return res.status(404).json({ 
+        success: false, 
+        message: "Event not found or unauthorized" 
+      });
+    }
+
+    res.status(200).json({
+      success: true,
+      message: "Event deactivated successfully",
+      data: result.rows[0]
+    });
+  } catch (err) {
+    console.error('Delete Error:', err.message);
+    res.status(500).json({ 
+      success: false, 
+      error: 'Database error',
+      message: err.message 
+    });
+  }
+});
+
+
+// The Dashboard API Endpoint
+app.get('/api/dashboard/stats', authenticateToken, async (req, res) => {
+  try {
+    const tenantId = req.user.tenant_id;
+    if (!tenantId) {
+      return res.status(400).json({ success: false, error: "Tenant ID missing in token" });
+    }
+
+    const dashboardQuery = `
+       WITH summary_stats AS (
+          SELECT 
+            (SELECT COUNT(*) as total_players FROM cd.player_details WHERE active = TRUE AND tenant_id = $1),
+            (SELECT COUNT(*) AS total_coaches FROM cd.coaches_details WHERE active = TRUE AND tenant_id = $1),
+            (SELECT COUNT(*) AS total_venues FROM cd.venues_data WHERE active = TRUE AND tenant_id = $1),
+            (SELECT COALESCE(SUM(amount_paid), 0) as monthly_revenue FROM cd.payment_details 
+             WHERE created_date >= date_trunc('month', current_date) AND tenant_id = $1),
+            (SELECT COUNT(*) FROM cd.registrations_details WHERE status = 'pending' AND tenant_id = $1)
+           
+      ),
+
+      recent_activities AS (
+          SELECT action, name, activity_time, type FROM (
+            SELECT 'New registration' AS action, name, application_date AS activity_time, 'registration' AS type
+            FROM cd.registrations_details
+            WHERE tenant_id = $1
+            UNION ALL
+            SELECT 'Payment received: ₹' || amount_paid AS action, full_name AS name, created_date AS activity_time, 'payment' AS type
+            FROM cd.payment_details
+            WHERE tenant_id = $1
+          ) t
+          ORDER BY activity_time DESC
+          LIMIT 5
+      ),
+
+        goals AS (
+          SELECT 
+            'Registration Goal' as title, 
+            (SELECT COUNT(*) FROM cd.player_details WHERE tenant_id = $1) as current_val, 
+            400 as target_val
+          UNION ALL
+          SELECT 
+            'Revenue Target', 
+            (SELECT COALESCE(SUM(amount_paid), 0) FROM cd.payment_details WHERE created_date >= date_trunc('month', current_date) AND tenant_id = $1), 
+            300000 
+        )
+
+      SELECT 
+          (SELECT row_to_json(summary_stats) FROM summary_stats) as stats,
+          (SELECT json_agg(recent_activities) FROM recent_activities) as activities,
+          (SELECT json_agg(goals) FROM goals) as goals_data;
+    `;
+    const result = await pool.query(dashboardQuery, [tenantId]);    
+    const dashboardData = result.rows[0];
+
+    res.json({
+      success: true,
+      data: {
+        stats: dashboardData.stats || {},
+        activities: dashboardData.activities || [],
+        goals_data: dashboardData.goals_data || []
+      }
     });
 
   } catch (err) {
-    console.error('Database query error:', err.stack);
-    res.status(500).send('Internal Server Error while fetching payment summary.');
+    console.error("Database Error:", err.message);
+    res.status(500).json({ success: false, error: "Internal Server Error" });
   }
 });
+
+
+//show the data baar graph API and code
+app.get('/api/dashboard-graph/stats', authenticateToken, async (req, res) => {
+    const tenantId = req.user.tenant_id;
+    const query = `
+        SELECT 
+            TO_CHAR(m.month, 'Mon') AS name,
+            COALESCE(p.players, 0) AS players,
+            COALESCE(c.coaches, 0) AS coaches
+        FROM (
+            SELECT generate_series(
+                date_trunc('year', CURRENT_DATE),
+                date_trunc('year', CURRENT_DATE) + INTERVAL '11 months',
+                INTERVAL '1 month'
+            ) AS month
+        ) m
+        LEFT JOIN (
+            SELECT 
+                date_trunc('month', created_at) AS month,
+                COUNT(*) AS players
+            FROM cd.player_details
+            WHERE active = TRUE 
+            AND tenant_id::text = $1::text
+              AND created_at >= date_trunc('year', CURRENT_DATE)
+              AND created_at <  date_trunc('year', CURRENT_DATE) + INTERVAL '1 year'
+            GROUP BY 1
+        ) p ON m.month = p.month
+        LEFT JOIN (
+            SELECT 
+                date_trunc('month', create_date) AS month,
+                COUNT(*) AS coaches
+            FROM cd.coaches_details
+            WHERE active = TRUE 
+            AND tenant_id::text = $1::text
+              AND create_date >= date_trunc('year', CURRENT_DATE)
+              AND create_date <  date_trunc('year', CURRENT_DATE) + INTERVAL '1 year'
+            GROUP BY 1
+        ) c ON m.month = c.month
+        ORDER BY m.month;
+    `;
+
+    try {
+        const result = await pool.query(query, [tenantId]);
+        res.json({ data: result.rows });
+    } catch (err) {
+        console.error('Database Error:', err.stack);
+        res.status(500).send('Server Error');
+    }
+});
+
+//show the pie chart API and code
+app.get('/api/player-stats/:tenantId', authenticateToken, async (req, res) => {
+  const { tenantId } = req.params;
+  const query = `
+    SELECT 
+      INITCAP(status) AS name, 
+      COUNT(*) AS value 
+    FROM cd.player_details 
+    WHERE tenant_id = $1 
+    GROUP BY status 
+    ORDER BY name;
+  `;
+
+  try {
+    const result = await pool.query(query, [tenantId]);
+    res.json(result.rows);
+  } catch (err) {
+    console.error('Database Error:', err.stack);
+    res.status(500).json({ error: 'Internal Server Error' });
+  }
+});
+
+// Dashboard pie-chart endpoint (player status distribution)
+app.get('/api/dashboard-piechart/stats', authenticateToken, async (req, res) => {
+  try {
+    const tenantId = req.user?.tenant_id;
+    if (!tenantId) return res.status(400).json({ success: false, error: 'Tenant ID missing' });
+
+    const query = `
+        SELECT
+    CASE
+        WHEN status = 'pending' THEN 'Pending'
+        WHEN active = TRUE THEN 'Active'
+        ELSE 'Inactive'
+    END AS name,
+    COUNT(*) AS value
+FROM cd.player_details
+WHERE tenant_id = $1
+GROUP BY
+    CASE
+        WHEN status = 'pending' THEN 'Pending'
+        WHEN active = TRUE THEN 'Active'
+        ELSE 'Inactive'
+    END
+ORDER BY name;
+    `;
+
+    const result = await pool.query(query, [tenantId]);
+
+    // Define specific colors for statuses for better UX
+    const statusColors = {
+      'Active': '#22c55e',   // Green
+      'Pending': '#f59e0b',  // Orange/Amber
+      'Inactive': '#ef4444'  // Red
+    };
+
+    const data = result.rows.map((r) => ({
+      name: r.name,
+      value: Number(r.value) || 0,
+      color: statusColors[r.name] || '#6366f1', // Default to Indigo if status unknown
+    }));
+
+    return res.json({ success: true, data });
+  } catch (err) {
+    console.error('Dashboard Pie Error:', err.stack || err.message);
+    return res.status(500).json({ success: false, error: 'Internal Server Error' });
+  }
+});
+
+//line chart show the API code 
+// THE ROUTE (Must match /api/revenue)
+app.get('/api/revenue', authenticateToken, async (req, res) => {
+  const tenantId = req.user.tenant_id;
+  const query = `
+    SELECT
+        EXTRACT(WEEK FROM created_date) 
+        - EXTRACT(WEEK FROM date_trunc('month', created_date)) + 1 AS week_no,
+        COALESCE(SUM(amount_paid), 0) AS revenue
+    FROM cd.payment_details
+    WHERE
+        created_date >= date_trunc('month', CURRENT_DATE)
+        AND tenant_id = $1
+    GROUP BY week_no
+    ORDER BY week_no;
+  `;
+
+  try {
+    const result = await pool.query(query, [tenantId]);
+    res.json({ success: true, data: result.rows });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ---------------------------------------------
 // START SERVER
 // ---------------------------------------------
-const PORT = process.env.PORT || 5001;
+const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => {
   console.log(`🚀 Server running on port ${PORT}`);
 });
