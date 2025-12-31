@@ -14,29 +14,30 @@ const { Pool } = pg;
 const app = express();
 
 // Allow common frontend dev ports (Vite/CRA) during development
-app.use(express.json());
-
-
 const allowedOrigins = [
-  "https://coneadmin.comdata.in",
-  "https://soneadmin.comdata.in",
   "http://localhost:8080",
   "http://localhost:8081",
+  "http://127.0.0.1:8080",
+  "http://127.0.0.1:8081"
 ];
 
 app.use(cors({
   origin: function (origin, callback) {
-    if (!origin) return callback(null, true); // Postman / curl
-    if (allowedOrigins.includes(origin)) {
-      return callback(null, true);
+    // Allow requests with no origin (like mobile apps or curl)
+    if (!origin) return callback(null, true);
+    
+    // Check if the origin is in our allowed list
+    if (allowedOrigins.indexOf(origin) !== -1) {
+      callback(null, true);
+    } else {
+      console.log("CORS blocked for origin:", origin);
+      callback(new Error("Not allowed by CORS"));
     }
-    callback(new Error("CORS not allowed"));
   },
   credentials: true,
   methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-  allowedHeaders: ["Content-Type", "Authorization"]
+  allowedHeaders: ["Content-Type", "Authorization", "X-Requested-With", "Accept"]
 }));
-
 
 
 // ---------------------------------------------
